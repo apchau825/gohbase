@@ -1454,6 +1454,155 @@ func TestScanConcurrencyControlSetCapacity(t *testing.T) {
 	}
 }
 
+func TestBatchRequestsConcurrencyControl(t *testing.T) {
+	done := make(chan struct{})
+	defer close(done)
+
+	// Create token bucket with capacity 1 and 1 initial token
+	tokenBucket, err := NewToken(1, 1, done)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := &client{
+		sent:                     make(map[uint32]hrpc.Call),
+		batchRequestsTokenBucket: tokenBucket,
+		logger:                   slog.Default(),
+	}
+
+	// start with 2 multis
+	multi1 := newMulti(1)
+	multi2 := newMulti(1)
+	defer freeMulti(multi1)
+	defer freeMulti(multi2)
+
+	// Register the first one
+	id1, err := c.registerRPC(multi1)
+	if err != nil {
+		t.Fatalf("First multi registration should succeed, got error: %v", err)
+	}
+
+	// Setup two chans to track the second multi's registration start & end
+	registrationStarted := make(chan struct{})
+	registrationCompleted := make(chan struct{})
+
+	var id2 uint32
+	var registerErr error
+
+	go func() {
+		close(registrationStarted)
+		id2, registerErr = c.registerRPC(multi2)
+		close(registrationCompleted)
+	}()
+
+	// multi2 should start but get blocked on registerRPC
+	<-registrationStarted
+
+	select {
+	case <-registrationCompleted:
+		t.Fatal("Second multi registration should be blocked")
+	default:
+	}
+
+	// Unregister multi1 to release the token
+	rpc := c.unregisterRPC(id1)
+	if rpc != multi1 {
+		t.Fatalf("Expected to get back multi1, got %v", rpc)
+	}
+
+	// we expect multi2 to acquire the token now and finish
+	<-registrationCompleted
+
+	if registerErr != nil {
+		t.Fatalf("Second multi registration failed: %v", registerErr)
+	}
+	if id2 == 0 {
+		t.Fatal("Second multi registration should have assigned a non-zero ID")
+	}
+
+	// unregister & cleanup multi2
+	rpc2 := c.unregisterRPC(id2)
+	if rpc2 != multi2 {
+		t.Fatalf("Expected to get back multi2, got %v", rpc2)
+	}
+}
+
+func TestBatchRequestsConcurrencyControlSetCapacity(t *testing.T) {
+	done := make(chan struct{})
+	defer close(done)
+
+	// capacity 2, 1 initial token
+	tokenBucket, err := NewToken(2, 1, done)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := &client{
+		sent:                     make(map[uint32]hrpc.Call),
+		batchRequestsTokenBucket: tokenBucket,
+		logger:                   slog.Default(),
+	}
+
+	ctx := context.Background()
+
+	multi1 := newMulti(1)
+	multi2 := newMulti(1)
+	defer freeMulti(multi1)
+	defer freeMulti(multi2)
+
+	id1, err := c.registerRPC(multi1)
+	if err != nil {
+		t.Fatalf("First multi registration should succeed, got error: %v", err)
+	}
+
+	// similar flow as previous test. setup two chans to track second multi's registration start
+	// and end.
+	registrationStarted := make(chan struct{})
+	registrationCompleted := make(chan struct{})
+
+	var id2 uint32
+	var registerErr error
+
+	go func() {
+		close(registrationStarted)
+		id2, registerErr = c.registerRPC(multi2)
+		close(registrationCompleted)
+	}()
+
+	// second one should start and get blocked on registerRPC waiting to acquire
+	<-registrationStarted
+
+	select {
+	case <-registrationCompleted:
+		t.Fatal("Second multi registration should be blocked")
+	default:
+	}
+
+	// bump up the capacity to 2, let second one now proceed on registerRPC
+	if err := tokenBucket.SetCapacity(ctx, 2); err != nil {
+		t.Fatalf("Failed to set capacity: %v", err)
+	}
+
+	<-registrationCompleted
+
+	if registerErr != nil {
+		t.Fatalf("Second multi registration failed: %v", registerErr)
+	}
+	if id2 == 0 {
+		t.Fatal("Second multi registration should have assigned a non-zero ID")
+	}
+
+	// cleanup both multis
+	rpc1 := c.unregisterRPC(id1)
+	if rpc1 != multi1 {
+		t.Fatalf("Expected to get back multi1, got %v", rpc1)
+	}
+	rpc2 := c.unregisterRPC(id2)
+	if rpc2 != multi2 {
+		t.Fatalf("Expected to get back multi2, got %v", rpc2)
+	}
+}
+
 func TestMarshalProtoHeaderAttributes(t *testing.T) {
 	tcs := []struct {
 		name       string

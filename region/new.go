@@ -52,10 +52,16 @@ type ScanControlOptions struct {
 	Interval time.Duration
 }
 
-// BatchRequestsControlOptions holds batch requests concurrency control configuration.
+// BatchRequestsControlOptions holds batch requests concurrency control configuration
 type BatchRequestsControlOptions struct {
-	// MaxConcurrency sets the maximum number of concurrent batch requests
-	MaxConcurrency int
+	// NewController is a factory function that creates controllers with min/max window bounds
+	NewController NewControllerFunc
+	// MinWindow sets the minimum window size (concurrency level)
+	MinWindow int
+	// MaxWindow sets the maximum window size (concurrency level)
+	MaxWindow int
+	// Interval sets the interval between ping puts
+	Interval time.Duration
 }
 
 // NewClient creates a new RegionClient with RegionClientOptions.
@@ -140,7 +146,7 @@ func (c *client) configScanControl(opts *ScanControlOptions) error {
 		return fmt.Errorf("interval must be greater than 0, got %v", opts.Interval)
 	}
 
-	c.pingInterval = opts.Interval
+	c.scanPingInterval = opts.Interval
 	c.scanTokenBucket = tb
 	c.scanTokenBucket.SetCapacity(context.Background(), initialWindow)
 	concurrentScans.WithLabelValues(c.addr).Set(float64(initialWindow))
@@ -148,21 +154,33 @@ func (c *client) configScanControl(opts *ScanControlOptions) error {
 }
 
 func (c *client) configBatchRequestsControl(opts *BatchRequestsControlOptions) error {
+	var err error
+
 	if opts == nil {
 		return nil
 	}
 
-	if opts.MaxConcurrency <= 0 {
-		return fmt.Errorf("max concurrency must be greater than 0, got %d", opts.MaxConcurrency)
-	}
-
-	tb, err := NewToken(opts.MaxConcurrency, opts.MaxConcurrency, c.done)
+	c.batchRequestsController, err = opts.NewController(opts.MinWindow, opts.MaxWindow)
 	if err != nil {
 		return err
 	}
 
+	// Fetch initial window / concurrency limit from controller
+	initialWindow := c.batchRequestsController.Window()
+
+	tb, err := NewToken(opts.MaxWindow, opts.MinWindow, c.done)
+	if err != nil {
+		return err
+	}
+
+	if opts.Interval <= 0 {
+		return fmt.Errorf("interval must be greater than 0, got %v", opts.Interval)
+	}
+
+	c.batchRequestsPingInterval = opts.Interval
 	c.batchRequestsTokenBucket = tb
-	concurrentBatchRequests.WithLabelValues(c.addr).Set(float64(opts.MaxConcurrency))
+	c.batchRequestsTokenBucket.SetCapacity(context.Background(), initialWindow)
+	concurrentBatchRequests.WithLabelValues(c.addr).Set(float64(initialWindow))
 	return nil
 }
 
@@ -197,8 +215,17 @@ func (c *client) Dial(ctx context.Context) error {
 
 		if c.ctype == RegionClient {
 			go c.processRPCs() // Batching goroutine
-			if c.pingInterval > 0 {
-				go c.controlLoop() // Ping goroutine for Scan concurrency control
+			if c.scanPingInterval > 0 {
+				go c.controlLoop("scan", c.scanPingInterval, c.scanController, c.scanTokenBucket,
+					func(newCapacity int) {
+						concurrentScans.WithLabelValues(c.addr).Set(float64(newCapacity))
+					})
+			}
+			if c.batchRequestsPingInterval > 0 {
+				go c.controlLoop("batch", c.batchRequestsPingInterval, c.batchRequestsController,
+					c.batchRequestsTokenBucket, func(newCapacity int) {
+						concurrentBatchRequests.WithLabelValues(c.addr).Set(float64(newCapacity))
+					})
 			}
 		}
 		go c.receiveRPCs() // Reader goroutine

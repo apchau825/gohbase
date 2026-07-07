@@ -57,10 +57,10 @@ var (
 		prometheus.HistogramOpts{
 			Namespace: "gohbase",
 			Name:      "ping_latency_seconds",
-			Help:      "Ping scan latency in seconds",
+			Help:      "Congestion control ping latency in seconds",
 			Buckets:   prometheus.ExponentialBuckets(0.0002, 2, 12),
 		},
-		[]string{"regionserver"},
+		[]string{"regionserver", "kind"},
 	)
 
 	concurrentScans = promauto.NewGaugeVec(
@@ -110,6 +110,29 @@ var (
 			Namespace: "gohbase",
 			Name:      "concurrent_batch_requests_limit_hit",
 			Help:      "Number of times concurrent batch requests limit was hit",
+		},
+		[]string{"regionserver"},
+	)
+
+	batchQueueLatency = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "gohbase",
+			Name:      "batch_queue_latency_seconds",
+			Help:      "Time spent waiting to execute a batch request",
+
+			// TODO: Buckets can be removed when NativeHistogram is adopted.
+			Buckets: prometheus.ExponentialBuckets(0.001, 2, 17),
+
+			// Recommended default NativeHistogram settings:
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: time.Hour,
+
+			// 2^-20 ≈ 954ns ≈ 1us — captures "token was ready" fast
+			// path and places those results in the zero bucket. This
+			// removes histogram fidelity at sub ~1us and saves it for
+			// the higher end of the scale.
+			NativeHistogramZeroThreshold: 0x1p-20,
 		},
 		[]string{"regionserver"},
 	)

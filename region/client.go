@@ -204,12 +204,14 @@ type client struct {
 	logger *slog.Logger
 
 	// scan concurrency control
-	pingInterval    time.Duration
-	scanController  Controller
-	scanTokenBucket *Token
+	scanPingInterval time.Duration
+	scanController   Controller
+	scanTokenBucket  *Token
 
 	// batch requests concurrency control
-	batchRequestsTokenBucket *Token
+	batchRequestsPingInterval time.Duration
+	batchRequestsController   Controller
+	batchRequestsTokenBucket  *Token
 }
 
 // QueueRPC will add an rpc call to the queue for processing by the writer goroutine
@@ -351,6 +353,7 @@ func (c *client) registerRPC(rpc hrpc.Call) (uint32, error) {
 	}
 
 	if _, isMulti := rpc.(*multi); isMulti && c.batchRequestsTokenBucket != nil {
+		t := time.Now()
 		// TryTake first to know if we have hit concurrency limit yet
 		if !c.batchRequestsTokenBucket.TryTake() {
 			if err := c.batchRequestsTokenBucket.Take(rpc.Context()); err != nil {
@@ -358,6 +361,7 @@ func (c *client) registerRPC(rpc hrpc.Call) (uint32, error) {
 			}
 			concurrentBatchRequestsLimitHit.WithLabelValues(c.addr).Inc()
 		}
+		batchQueueLatency.WithLabelValues(c.addr).Observe(time.Since(t).Seconds())
 	}
 
 	currID := atomic.AddUint32(&c.id, 1)
@@ -908,11 +912,39 @@ func (c *client) MarshalJSON() ([]byte, error) {
 	return json.Marshal(state)
 }
 
-// controlLoop runs periodic ping Get requests to measure latency and implement congestion control
-func (c *client) controlLoop() {
-	c.logger.Info("starting ping loop", "interval", c.pingInterval)
+// newControlPing returns an hrpc Call that can be used as a ping for latency on the write or
+// read queue
+func newControlPing(ctx context.Context, kind string, reg hrpc.RegionInfo) (hrpc.Call, error) {
+	switch kind {
+	case "scan":
+		get, err := hrpc.NewGet(ctx, []byte("hbase:meta"), []byte("ping"))
+		if err != nil {
+			return nil, err
+		}
+		get.SetRegion(reg)
+		return get, nil
+	case "batch":
+		put, err := hrpc.NewPut(ctx, []byte("hbase:meta"), []byte("ping"),
+			map[string]map[string][]byte{
+				"cf": {"a": []byte("1")},
+			})
+		if err != nil {
+			return nil, err
+		}
+		put.SetRegion(reg)
+		return put, nil
+	default:
+		return nil, fmt.Errorf("unknown control loop kind %q", kind)
+	}
+}
 
-	ticker := time.NewTicker(c.pingInterval)
+// controlLoop sends periodic ping RPCs given some interval, adjusting our max concurrency if
+// necessary
+func (c *client) controlLoop(kind string, interval time.Duration, controller Controller,
+	bucket *Token, onCapacityChange func(newCapacity int)) {
+	c.logger.Info("starting ping loop", "kind", kind, "interval", interval)
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// Create a dummy region for ping requests - use hbase:meta which always exists
@@ -933,45 +965,46 @@ func (c *client) controlLoop() {
 		case <-c.done:
 			return
 		case <-ticker.C:
-			// Create a new Get request for each ping - use a non-existent row key
-			// This will return quickly with no data
-			get, err := hrpc.NewGet(ctx, []byte("hbase:meta"), []byte("ping"))
+			ping, err := newControlPing(ctx, kind, pingRegion)
 			if err != nil {
-				c.logger.Error("failed to create ping get", "error", err)
+				c.logger.Error("failed to create control ping", "kind", kind, "error", err)
 				continue
 			}
-			get.SetRegion(pingRegion)
 
 			start := time.Now()
 
-			// Send the get request
-			err = c.trySend(get)
+			// Send the ping RPC
+			err = c.trySend(ping)
 
 			if err != nil {
-				c.logger.Debug("ping send failure", "err", err)
+				c.logger.Debug("ping send failure", "kind", kind, "err", err)
 				continue
 			}
 
 			// Wait for the response
-			result := <-get.ResultChan()
+			result := <-ping.ResultChan()
 
 			// We expect that response will have an exception,
 			// but ServerError means client is failed and goroutine should exit.
-			if _, ok := result.Error.(ServerError); ok {
+			if serr, ok := result.Error.(ServerError); ok {
+				c.logger.Debug("failed on ping RPC", "kind", kind, "error", serr.Error())
 				return
 			}
 
 			latency := time.Since(start)
 
 			// Record the latency and update tokens if needed
-			pingLatency.WithLabelValues(c.addr).Observe(latency.Seconds())
-			maxScans, changed := c.scanController.Latency(latency)
+			pingLatency.WithLabelValues(c.addr, kind).Observe(latency.Seconds())
+			newCapacity, changed := controller.Latency(latency)
 			if changed {
-				c.scanTokenBucket.SetCapacity(ctx, maxScans)
-				concurrentScans.WithLabelValues(c.addr).Set(float64(maxScans))
+				if err := bucket.SetCapacity(ctx, newCapacity); err != nil {
+					c.logger.Debug("failed to update token bucket capacity", "err", err)
+					return
+				}
+				onCapacityChange(newCapacity)
 			}
 
-			c.logger.Debug("ping", "error", result.Error, "latency", latency)
+			c.logger.Debug("ping", "kind", kind, "error", result.Error, "latency", latency)
 		}
 	}
 }
